@@ -5,12 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
 	mockconn "github.com/go-mysql-org/go-mysql/test_util/conn"
+	perrors "github.com/pingcap/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,6 +37,85 @@ func TestConnWriteOK(t *testing.T) {
 	err = conn.writeOK(result)
 	require.NoError(t, err)
 	expected = []byte{7, 0, 0, 1, mysql.OK_HEADER, 1, 2, 0, 8, 0, 0}
+	require.Equal(t, expected, clientConn.WriteBuffered)
+}
+
+func TestConnWriteOKWithSessionTrack(t *testing.T) {
+	clientConn := &mockconn.MockConn{}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+	conn.SetCapability(mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_SESSION_TRACK)
+
+	result := mysql.NewResultReserveResultset(0)
+	result.AffectedRows = 1
+	result.InsertId = 2
+	result.Status = mysql.SERVER_SESSION_STATE_CHANGED
+	result.SessionTracking = &mysql.SessionTrackingInfo{
+		Schema: "mysql",
+		State:  "1",
+	}
+
+	err := conn.writeOK(result)
+	require.NoError(t, err)
+
+	sessionTrackBlock := []byte{
+		mysql.SESSION_TRACK_SCHEMA, 0x6, 0x5, 'm', 'y', 's', 'q', 'l',
+		mysql.SESSION_TRACK_STATE_CHANGE, 0x1, '1',
+	}
+	expectedPayload := []byte{
+		mysql.OK_HEADER, 1, 2,
+		0x00, 0x40, // SERVER_SESSION_STATE_CHANGED
+		0x00, 0x00, // warnings
+		0x00, // status message length
+		byte(len(sessionTrackBlock)),
+	}
+	expectedPayload = append(expectedPayload, sessionTrackBlock...)
+	expected := append([]byte{byte(len(expectedPayload)), 0, 0, 0}, expectedPayload...)
+	require.Equal(t, expected, clientConn.WriteBuffered)
+}
+
+func TestConnWriteOKStatusMessageWithoutStateChange(t *testing.T) {
+	clientConn := &mockconn.MockConn{}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+	conn.SetCapability(mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_SESSION_TRACK)
+
+	result := mysql.NewResultReserveResultset(0)
+	result.AffectedRows = 1
+	result.InsertId = 2
+	result.StatusMessage = "hello"
+	// No SERVER_SESSION_STATE_CHANGED — only the info string should be emitted.
+
+	err := conn.writeOK(result)
+	require.NoError(t, err)
+
+	msg := []byte("hello")
+	expectedPayload := []byte{
+		mysql.OK_HEADER, 1, 2,
+		0x00, 0x00, // status flags (no SESSION_STATE_CHANGED)
+		0x00, 0x00, // warnings
+		byte(len(msg)), // info lenenc length
+	}
+	expectedPayload = append(expectedPayload, msg...)
+	expected := append([]byte{byte(len(expectedPayload)), 0, 0, 0}, expectedPayload...)
+	require.Equal(t, expected, clientConn.WriteBuffered)
+}
+
+func TestConnWriteOKSessionTrackWithoutStateChangeOrInfo(t *testing.T) {
+	clientConn := &mockconn.MockConn{}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+	conn.SetCapability(mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_SESSION_TRACK)
+
+	result := mysql.NewResultReserveResultset(0)
+	err := conn.writeOK(result)
+	require.NoError(t, err)
+
+	// Auth-style OK: empty info string only; no session-state block.
+	expectedPayload := []byte{
+		mysql.OK_HEADER, 0, 0,
+		0x00, 0x00, // status
+		0x00, 0x00, // warnings
+		0x00, // empty info string
+	}
+	expected := append([]byte{byte(len(expectedPayload)), 0, 0, 0}, expectedPayload...)
 	require.Equal(t, expected, clientConn.WriteBuffered)
 }
 
@@ -79,6 +161,39 @@ func TestConnWriteError(t *testing.T) {
 	require.NoError(t, err)
 	expected = []byte{13, 0, 0, 2, mysql.ERR_HEADER, 81, 4, 35, 72, 89, 48, 48, 48, 116, 101, 115, 116}
 	require.Equal(t, expected, clientConn.WriteBuffered)
+}
+
+// Wrapped *mysql.MyError values must keep their code, SQLSTATE, and message.
+// 1062 is 0x0426; the ERR payload is 0xff, code LE, '#', 5-byte state, message.
+func TestConnWriteErrorWrappedMyError(t *testing.T) {
+	const msg = "Duplicate entry '1' for key 'PRIMARY'"
+	merr := mysql.NewError(mysql.ER_DUP_ENTRY, msg)
+
+	payload := append([]byte{
+		mysql.ERR_HEADER,
+		0x26, 0x04,
+		'#',
+		'2', '3', '0', '0', '0',
+	}, msg...)
+	expected := append([]byte{byte(len(payload)), 0, 0, 0}, payload...)
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "pingcap Trace", err: perrors.Trace(merr)},
+		{name: "fmt wrap", err: fmt.Errorf("stmt execute: %w", merr)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConn := &mockconn.MockConn{}
+			conn := &Conn{Conn: packet.NewConn(clientConn)}
+			conn.SetCapability(mysql.CLIENT_PROTOCOL_41)
+
+			require.NoError(t, conn.writeError(tc.err))
+			require.Equal(t, expected, clientConn.WriteBuffered)
+		})
+	}
 }
 
 func TestConnWriteAuthSwitchRequest(t *testing.T) {
@@ -185,13 +300,39 @@ func TestConnWriteResultset(t *testing.T) {
 	require.Equal(t, []byte{1, 0, 0, 7, mysql.EOF_HEADER}, clientConn.WriteBuffered[43:])
 }
 
+func TestConnWriteResultsetDeprecateEOF(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{
+		Conn:       packet.NewConn(clientConn),
+		serverConf: &Server{capability: mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_DEPRECATE_EOF},
+		capability: mysql.CLIENT_PROTOCOL_41 | mysql.CLIENT_DEPRECATE_EOF,
+	}
+
+	r, err := mysql.BuildSimpleTextResultset([]string{"a"}, [][]any{{"b"}})
+	require.NoError(t, err)
+	err = conn.writeResultset(r)
+	require.NoError(t, err)
+
+	// column count
+	require.Equal(t, []byte{1, 0, 0, 0, 1}, clientConn.WriteBuffered[:5])
+	// field packet, with no EOF separator following it
+	require.Equal(t, []byte{23, 0, 0, 1, 3, 100, 101, 102, 0, 0, 0, 1, 'a', 0, 12, 33, 0, 0, 0, 0, 0, 253, 0, 0, 0, 0, 0}, clientConn.WriteBuffered[5:32])
+	// rowdata directly after the fields
+	require.Equal(t, []byte{2, 0, 0, 2, 1, 'b'}, clientConn.WriteBuffered[32:38])
+	// terminating OK packet with an EOF header:
+	// 0xFE, affected rows (0), last insert id (0), status (2), warnings (2)
+	require.Equal(t, []byte{7, 0, 0, 3, mysql.EOF_HEADER, 0, 0, 0, 0, 0, 0}, clientConn.WriteBuffered[38:])
+}
+
 func TestConnWriteFieldList(t *testing.T) {
 	clientConn := &mockconn.MockConn{MultiWrite: true}
 	conn := &Conn{Conn: packet.NewConn(clientConn)}
 
 	r, err := mysql.BuildSimpleTextResultset([]string{"c"}, [][]any{{"d"}})
 	require.NoError(t, err)
-	err = conn.writeFieldList(r.Fields, nil)
+	// COM_FIELD_LIST response path: column definitions followed by a
+	// terminator (writeFieldList itself writes none).
+	err = conn.WriteValue(r.Fields)
 	require.NoError(t, err)
 
 	// column length 1
@@ -210,6 +351,10 @@ func TestConnWriteFieldValues(t *testing.T) {
 
 	require.NoError(t, err)
 	err = conn.writeFieldList(r.Fields, nil)
+	require.NoError(t, err)
+	// writeFieldList writes no terminator anymore; append it as the
+	// resultset path does for pre-DEPRECATE_EOF clients
+	err = conn.writeEOF()
 	require.NoError(t, err)
 
 	// fields and EOF
@@ -386,10 +531,15 @@ func TestConnWriteStreamResultsetWithError(t *testing.T) {
 		sr.Close()
 	}()
 
-	// write stream resultset should return the error
+	// write stream resultset should write the error packet
+	// but leave the connection usable
 	err := conn.WriteValue(sr.AsResult())
-	require.Error(t, err)
-	require.Equal(t, testErr, err)
+	require.NoError(t, err)
+	require.Contains(t, clientConn.WriteBuffered, mysql.ERR_HEADER)
+	require.Contains(t, string(clientConn.WriteBuffered), testErr.Error())
+
+	require.NoError(t, conn.WriteValue(mysql.NewResultReserveResultset(0)))
+	require.False(t, clientConn.Closed)
 }
 
 func TestConnWriteStreamResultsetWithNullValue(t *testing.T) {
@@ -431,6 +581,30 @@ func TestStreamResultEmptyResult(t *testing.T) {
 	require.True(t, len(clientConn.WriteBuffered) > 0)
 }
 
+// extractBinaryRowPackets parses the test write buffer and returns packets
+// starting with the 0x00 binary-row header. The streaming path never emits
+// an OK packet (also 0x00) inline, so the marker is unambiguous here.
+func extractBinaryRowPackets(data []byte) [][]byte {
+	var rowPackets [][]byte
+	pos := 0
+	for pos < len(data) {
+		if pos+4 > len(data) {
+			break
+		}
+		pktLen := int(uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16)
+		pos += 4
+		if pos+pktLen > len(data) {
+			break
+		}
+		pktData := data[pos : pos+pktLen]
+		pos += pktLen
+		if len(pktData) > 0 && pktData[0] == 0x00 {
+			rowPackets = append(rowPackets, pktData)
+		}
+	}
+	return rowPackets
+}
+
 // TestConnWriteStreamResultsetBinary tests binary protocol streaming with data parsing.
 func TestConnWriteStreamResultsetBinary(t *testing.T) {
 	clientConn := &mockconn.MockConn{MultiWrite: true}
@@ -450,32 +624,9 @@ func TestConnWriteStreamResultsetBinary(t *testing.T) {
 		sr.WriteRow(ctx, []any{int64(2), "bob"})
 	}()
 
-	err := conn.WriteValue(sr.AsResult())
-	require.NoError(t, err)
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
 
-	// Parse packets from the buffer
-	data := clientConn.WriteBuffered
-	var rowPackets [][]byte
-	pos := 0
-	for pos < len(data) {
-		if pos+4 > len(data) {
-			break
-		}
-		// Packet header: 3 bytes length + 1 byte sequence
-		pktLen := int(uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16)
-		pos += 4
-		if pos+pktLen > len(data) {
-			break
-		}
-		pktData := data[pos : pos+pktLen]
-		pos += pktLen
-
-		// Binary row packets start with 0x00 header
-		if len(pktData) > 0 && pktData[0] == 0x00 {
-			rowPackets = append(rowPackets, pktData)
-		}
-	}
-
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
 	require.Len(t, rowPackets, 2, "Should have 2 binary row packets")
 
 	// Parse first row
@@ -511,30 +662,9 @@ func TestConnWriteStreamResultsetBinaryWithNull(t *testing.T) {
 		sr.WriteRow(ctx, []any{"data", nil})
 	}()
 
-	err := conn.WriteValue(sr.AsResult())
-	require.NoError(t, err)
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
 
-	// Parse packets
-	data := clientConn.WriteBuffered
-	var rowPackets [][]byte
-	pos := 0
-	for pos < len(data) {
-		if pos+4 > len(data) {
-			break
-		}
-		pktLen := int(uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16)
-		pos += 4
-		if pos+pktLen > len(data) {
-			break
-		}
-		pktData := data[pos : pos+pktLen]
-		pos += pktLen
-
-		if len(pktData) > 0 && pktData[0] == 0x00 {
-			rowPackets = append(rowPackets, pktData)
-		}
-	}
-
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
 	require.Len(t, rowPackets, 2)
 
 	// Parse first row: NULL, "value"
@@ -548,4 +678,179 @@ func TestConnWriteStreamResultsetBinaryWithNull(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "data", string(row2[0].AsString()))
 	require.Nil(t, row2[1].Value()) // NULL
+}
+
+// TestConnWriteStreamResultsetBinaryNarrowIntegers verifies the streaming
+// binary writer respects the declared column width for fixed-width integers
+// (TINY/SHORT/INT24/LONG/LONGLONG, signed and unsigned). Pre-fix, the writer
+// always emitted 8 bytes regardless of declared type.
+func TestConnWriteStreamResultsetBinaryNarrowIntegers(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+
+	fields := []*mysql.Field{
+		{Name: []byte("c_tiny"), Type: mysql.MYSQL_TYPE_TINY},
+		{Name: []byte("c_utiny"), Type: mysql.MYSQL_TYPE_TINY, Flag: mysql.UNSIGNED_FLAG},
+		{Name: []byte("c_short"), Type: mysql.MYSQL_TYPE_SHORT},
+		{Name: []byte("c_year"), Type: mysql.MYSQL_TYPE_YEAR, Flag: mysql.UNSIGNED_FLAG},
+		{Name: []byte("c_int24"), Type: mysql.MYSQL_TYPE_INT24},
+		{Name: []byte("c_long"), Type: mysql.MYSQL_TYPE_LONG},
+		{Name: []byte("c_longlong"), Type: mysql.MYSQL_TYPE_LONGLONG},
+	}
+	sr := mysql.NewStreamResult(fields, 1, true)
+
+	go func() {
+		defer sr.Close()
+		ctx := context.Background()
+		sr.WriteRow(ctx, []any{
+			int8(-7), uint8(200),
+			int16(-12345), uint16(2026),
+			int32(-1234567), int32(2147483600),
+			int64(9223372036854775000),
+		})
+	}()
+
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
+
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
+	require.Len(t, rowPackets, 1)
+
+	row, err := mysql.RowData(rowPackets[0]).ParseBinary(fields, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(-7), row[0].AsInt64())
+	require.Equal(t, uint64(200), row[1].AsUint64())
+	require.Equal(t, int64(-12345), row[2].AsInt64())
+	require.Equal(t, uint64(2026), row[3].AsUint64())
+	require.Equal(t, int64(-1234567), row[4].AsInt64())
+	require.Equal(t, int64(2147483600), row[5].AsInt64())
+	require.Equal(t, int64(9223372036854775000), row[6].AsInt64())
+}
+
+// TestConnWriteStreamResultsetBinaryFloats verifies FLOAT is encoded as
+// 4 bytes of Float32bits (not truncated Float64bits) and DOUBLE as 8 bytes
+// of Float64bits.
+func TestConnWriteStreamResultsetBinaryFloats(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+
+	fields := []*mysql.Field{
+		{Name: []byte("c_float"), Type: mysql.MYSQL_TYPE_FLOAT},
+		{Name: []byte("c_double"), Type: mysql.MYSQL_TYPE_DOUBLE},
+	}
+	sr := mysql.NewStreamResult(fields, 1, true)
+
+	go func() {
+		defer sr.Close()
+		sr.WriteRow(context.Background(), []any{float32(3.5), float64(2.718281828459045)})
+	}()
+
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
+
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
+	require.Len(t, rowPackets, 1)
+
+	row, err := mysql.RowData(rowPackets[0]).ParseBinary(fields, nil)
+	require.NoError(t, err)
+	require.InDelta(t, 3.5, row[0].AsFloat64(), 1e-6)
+	require.InDelta(t, 2.718281828459045, row[1].AsFloat64(), 1e-12)
+}
+
+// TestConnWriteStreamResultsetBinaryLengthEncodedStrings verifies that
+// length-encoded variable-width types beyond MYSQL_TYPE_VAR_STRING (VARCHAR,
+// STRING, BLOB, DECIMAL, JSON) are length-prefixed on the wire.
+func TestConnWriteStreamResultsetBinaryLengthEncodedStrings(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+
+	fields := []*mysql.Field{
+		{Name: []byte("c_varchar"), Type: mysql.MYSQL_TYPE_VARCHAR},
+		{Name: []byte("c_string"), Type: mysql.MYSQL_TYPE_STRING},
+		{Name: []byte("c_blob"), Type: mysql.MYSQL_TYPE_BLOB},
+		{Name: []byte("c_decimal"), Type: mysql.MYSQL_TYPE_NEWDECIMAL},
+		{Name: []byte("c_json"), Type: mysql.MYSQL_TYPE_JSON},
+	}
+	sr := mysql.NewStreamResult(fields, 1, true)
+
+	go func() {
+		defer sr.Close()
+		sr.WriteRow(context.Background(), []any{
+			"abc",
+			"hello",
+			[]byte{0x00, 0x01, 0x02},
+			"1234.5678",
+			[]byte(`{"k":"v"}`),
+		})
+	}()
+
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
+
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
+	require.Len(t, rowPackets, 1)
+
+	row, err := mysql.RowData(rowPackets[0]).ParseBinary(fields, nil)
+	require.NoError(t, err)
+	require.Equal(t, "abc", string(row[0].AsString()))
+	require.Equal(t, "hello", string(row[1].AsString()))
+	require.Equal(t, []byte{0x00, 0x01, 0x02}, row[2].AsString())
+	require.Equal(t, "1234.5678", string(row[3].AsString()))
+	require.Equal(t, `{"k":"v"}`, string(row[4].AsString()))
+}
+
+// TestConnWriteStreamResultsetBinaryTemporals verifies that DATE / DATETIME /
+// TIMESTAMP / TIME columns receive a length-prefixed packed binary
+// representation when written from a time.Time value.
+func TestConnWriteStreamResultsetBinaryTemporals(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+
+	fields := []*mysql.Field{
+		{Name: []byte("c_date"), Type: mysql.MYSQL_TYPE_DATE},
+		{Name: []byte("c_datetime"), Type: mysql.MYSQL_TYPE_DATETIME},
+		{Name: []byte("c_timestamp"), Type: mysql.MYSQL_TYPE_TIMESTAMP},
+	}
+	sr := mysql.NewStreamResult(fields, 1, true)
+
+	dt := time.Date(2026, time.April, 28, 9, 30, 15, 0, time.UTC)
+	go func() {
+		defer sr.Close()
+		sr.WriteRow(context.Background(), []any{dt, dt, dt})
+	}()
+
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
+
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
+	require.Len(t, rowPackets, 1)
+
+	row, err := mysql.RowData(rowPackets[0]).ParseBinary(fields, nil)
+	require.NoError(t, err)
+	require.Equal(t, "2026-04-28", string(row[0].AsString()))
+	require.Equal(t, "2026-04-28 09:30:15", string(row[1].AsString()))
+	require.Equal(t, "2026-04-28 09:30:15", string(row[2].AsString()))
+}
+
+// TestConnWriteStreamResultsetBinaryTime verifies the streaming binary writer
+// emits a length-prefixed packed TIME payload with no embedded date.
+func TestConnWriteStreamResultsetBinaryTime(t *testing.T) {
+	clientConn := &mockconn.MockConn{MultiWrite: true}
+	conn := &Conn{Conn: packet.NewConn(clientConn)}
+
+	fields := []*mysql.Field{
+		{Name: []byte("c_time"), Type: mysql.MYSQL_TYPE_TIME},
+	}
+	sr := mysql.NewStreamResult(fields, 1, true)
+
+	tm := time.Date(0, 1, 1, 12, 34, 56, 0, time.UTC)
+	go func() {
+		defer sr.Close()
+		sr.WriteRow(context.Background(), []any{tm})
+	}()
+
+	require.NoError(t, conn.WriteValue(sr.AsResult()))
+
+	rowPackets := extractBinaryRowPackets(clientConn.WriteBuffered)
+	require.Len(t, rowPackets, 1)
+
+	row, err := mysql.RowData(rowPackets[0]).ParseBinary(fields, nil)
+	require.NoError(t, err)
+	require.Equal(t, "12:34:56", string(row[0].AsString()))
 }

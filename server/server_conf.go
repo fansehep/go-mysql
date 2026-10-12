@@ -5,9 +5,19 @@ import (
 	"crypto/tls"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 )
+
+// userConfigurableServerCapabilities lists handshake flags that may be toggled
+// via SetCapability / UnsetCapability. Other flags (e.g. CLIENT_SSL) are derived
+// from server construction and must not be changed independently.
+const userConfigurableServerCapabilities = mysql.CLIENT_FOUND_ROWS |
+	mysql.CLIENT_LOCAL_FILES |
+	mysql.CLIENT_MULTI_RESULTS |
+	mysql.CLIENT_PS_MULTI_RESULTS |
+	mysql.CLIENT_DEPRECATE_EOF
 
 // Defines a basic MySQL server with configs.
 //
@@ -54,7 +64,8 @@ func NewDefaultServer() *Server {
 		protocolVersion: 10,
 		capability: mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_LONG_FLAG | mysql.CLIENT_CONNECT_WITH_DB | mysql.CLIENT_PROTOCOL_41 |
 			mysql.CLIENT_TRANSACTIONS | mysql.CLIENT_SECURE_CONNECTION | mysql.CLIENT_PLUGIN_AUTH | mysql.CLIENT_SSL |
-			mysql.CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | mysql.CLIENT_CONNECT_ATTRS,
+			mysql.CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | mysql.CLIENT_CONNECT_ATTRS | mysql.CLIENT_SESSION_TRACK |
+			mysql.CLIENT_MULTI_RESULTS | mysql.CLIENT_PS_MULTI_RESULTS | mysql.CLIENT_DEPRECATE_EOF,
 		collationID:       mysql.DEFAULT_COLLATION_ID,
 		defaultAuthMethod: mysql.AUTH_NATIVE_PASSWORD,
 		rsaPrivateKey:     rsaPrivateKey,
@@ -100,7 +111,8 @@ func NewServerWithAuth(serverVersion string, collationID uint8, defaultAuthMetho
 
 	capFlag := mysql.CLIENT_LONG_PASSWORD | mysql.CLIENT_LONG_FLAG | mysql.CLIENT_CONNECT_WITH_DB | mysql.CLIENT_PROTOCOL_41 |
 		mysql.CLIENT_TRANSACTIONS | mysql.CLIENT_SECURE_CONNECTION | mysql.CLIENT_PLUGIN_AUTH | mysql.CLIENT_CONNECT_ATTRS |
-		mysql.CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+		mysql.CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | mysql.CLIENT_SESSION_TRACK |
+		mysql.CLIENT_MULTI_RESULTS | mysql.CLIENT_PS_MULTI_RESULTS | mysql.CLIENT_DEPRECATE_EOF
 	if tlsConfig != nil {
 		capFlag |= mysql.CLIENT_SSL
 	}
@@ -124,4 +136,58 @@ func isAuthMethodSupported(authMethod string) bool {
 
 func (s *Server) InvalidateCache(username string, host string) {
 	s.cacheShaPassword.Delete(fmt.Sprintf("%s@%s", username, host))
+}
+
+// Capability returns the capability flags advertised in the initial handshake.
+func (s *Server) Capability() uint32 {
+	return atomic.LoadUint32(&s.capability)
+}
+
+// SetCapability enables additional server capabilities advertised in the handshake.
+// Only CLIENT_FOUND_ROWS, CLIENT_LOCAL_FILES, CLIENT_MULTI_RESULTS,
+// CLIENT_PS_MULTI_RESULTS, and CLIENT_DEPRECATE_EOF may be set; other flags are
+// managed by server construction (e.g. CLIENT_SSL requires TLS).
+//
+// Advertising a capability does not implement it. CLIENT_FOUND_ROWS, which makes an
+// UPDATE report rows matched instead of rows changed, is up to the Handler: this
+// package never computes affected rows. A Handler honoring it must check
+// (*Conn).HasCapability(mysql.CLIENT_FOUND_ROWS) and set AffectedRows on the
+// mysql.Result it returns accordingly.
+func (s *Server) SetCapability(capability uint32) error {
+	if err := validateUserConfigurableCapability(capability); err != nil {
+		return err
+	}
+	for {
+		old := atomic.LoadUint32(&s.capability)
+		if atomic.CompareAndSwapUint32(&s.capability, old, old|capability) {
+			break
+		}
+	}
+	return nil
+}
+
+// UnsetCapability disables server capabilities advertised in the handshake.
+// Only CLIENT_FOUND_ROWS, CLIENT_LOCAL_FILES, CLIENT_MULTI_RESULTS,
+// CLIENT_PS_MULTI_RESULTS, and CLIENT_DEPRECATE_EOF may be cleared via this API.
+func (s *Server) UnsetCapability(capability uint32) error {
+	if err := validateUserConfigurableCapability(capability); err != nil {
+		return err
+	}
+	for {
+		old := atomic.LoadUint32(&s.capability)
+		if atomic.CompareAndSwapUint32(&s.capability, old, old&^capability) {
+			break
+		}
+	}
+	return nil
+}
+
+func validateUserConfigurableCapability(capability uint32) error {
+	if capability == 0 {
+		return fmt.Errorf("capability must not be zero")
+	}
+	if invalid := capability &^ userConfigurableServerCapabilities; invalid != 0 {
+		return fmt.Errorf("server capability %#x contains non-user-configurable flags %#x; only CLIENT_FOUND_ROWS, CLIENT_LOCAL_FILES, CLIENT_MULTI_RESULTS, CLIENT_PS_MULTI_RESULTS, and CLIENT_DEPRECATE_EOF are supported", capability, invalid)
+	}
+	return nil
 }

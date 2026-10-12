@@ -49,6 +49,49 @@ func (s *Stmt) ExecuteSelectStreaming(result *mysql.Result, perRowCb SelectPerRo
 	return s.conn.readResultStreaming(true, result, perRowCb, perResCb)
 }
 
+// StmtProcedureMultiResultForward is called once per logical result returned by
+// COM_STMT_EXECUTE. When err is non-nil, res is nil. Implementations typically
+// forward each result to a proxy client via server.Conn.WriteValue.
+// A nil return from forward means the result or error was handled successfully.
+type StmtProcedureMultiResultForward func(res *mysql.Result, err error) error
+
+// ExecuteProcedureMultiResults runs COM_STMT_EXECUTE and reads every response
+// until SERVER_MORE_RESULTS_EXISTS is clear (CALL / stored procedures with
+// multiple result sets). forward is called for each result in arrival order;
+// the loop continues draining the server response even after forward returns
+// non-nil, matching ExecuteMultiple semantics so that unread packets do not
+// corrupt the connection state.
+//
+// The first non-nil error returned by forward is saved and returned after all
+// results have been drained. If forward handles an error and returns nil, that
+// error is not propagated.
+func (s *Stmt) ExecuteProcedureMultiResults(forward StmtProcedureMultiResultForward, args ...any) error {
+	if forward == nil {
+		return errors.New("forward callback cannot be nil")
+	}
+	if err := s.write(args...); err != nil {
+		return errors.Trace(err)
+	}
+	var forwardErr error
+	for {
+		res, err := s.conn.readResult(true)
+		if forwardErr == nil {
+			if err != nil {
+				forwardErr = forward(nil, err)
+			} else if res != nil {
+				forwardErr = forward(res, nil)
+			}
+		}
+		if err != nil {
+			break
+		}
+		if res == nil || res.Status&mysql.SERVER_MORE_RESULTS_EXISTS == 0 {
+			break
+		}
+	}
+	return forwardErr
+}
+
 func (s *Stmt) Close() error {
 	if err := s.conn.writeCommandUint32(mysql.COM_STMT_CLOSE, s.ID); err != nil {
 		return errors.Trace(err)
@@ -59,7 +102,7 @@ func (s *Stmt) Close() error {
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
 func (s *Stmt) write(args ...any) error {
-	defer clear(s.conn.queryAttributes)
+	defer func() { s.conn.queryAttributes = nil }()
 	paramsNum := s.Params
 
 	if len(args) != paramsNum {
@@ -78,6 +121,9 @@ func (s *Stmt) write(args ...any) error {
 	}
 
 	qaLen := len(s.conn.queryAttributes)
+	if s.conn.capability&mysql.CLIENT_QUERY_ATTRIBUTES == 0 {
+		qaLen = 0
+	}
 	paramTypes := make([][]byte, paramsNum+qaLen)
 	paramFlags := make([][]byte, paramsNum+qaLen)
 	paramValues := make([][]byte, paramsNum+qaLen)
@@ -172,12 +218,13 @@ func (s *Stmt) write(args ...any) error {
 
 		length += len(paramValues[i])
 	}
-	for i, qa := range s.conn.queryAttributes {
+	for i, qa := range s.conn.queryAttributes[:qaLen] {
 		tf := qa.TypeAndFlag()
 		paramTypes[(i + paramsNum)] = []byte{tf[0]}
 		paramFlags[i+paramsNum] = []byte{tf[1]}
 		paramValues[i+paramsNum] = qa.ValueBytes()
 		paramNames[i+paramsNum] = mysql.PutLengthEncodedString([]byte(qa.Name))
+		newParamBoundFlag = 1
 	}
 
 	data := utils.BytesBufferGet()
@@ -193,7 +240,7 @@ func (s *Stmt) write(args ...any) error {
 	data.Write([]byte{byte(s.ID), byte(s.ID >> 8), byte(s.ID >> 16), byte(s.ID >> 24)})
 
 	flags := mysql.CURSOR_TYPE_NO_CURSOR
-	if paramsNum > 0 {
+	if s.conn.capability&mysql.CLIENT_QUERY_ATTRIBUTES > 0 && paramsNum+qaLen > 0 {
 		flags |= mysql.PARAMETER_COUNT_AVAILABLE
 	}
 	data.WriteByte(flags)
@@ -203,7 +250,7 @@ func (s *Stmt) write(args ...any) error {
 
 	if paramsNum > 0 || (s.conn.capability&mysql.CLIENT_QUERY_ATTRIBUTES > 0 && (flags&mysql.PARAMETER_COUNT_AVAILABLE > 0)) {
 		if s.conn.capability&mysql.CLIENT_QUERY_ATTRIBUTES > 0 {
-			paramsNum += len(s.conn.queryAttributes)
+			paramsNum += qaLen
 			data.Write(mysql.PutLengthEncodedInt(uint64(paramsNum)))
 		}
 		if paramsNum > 0 {

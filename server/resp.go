@@ -28,13 +28,16 @@ func (c *Conn) writeOK(r *mysql.Result) error {
 		data = append(data, byte(r.Warnings), byte(r.Warnings>>8))
 	}
 
+	if c.capability&mysql.CLIENT_SESSION_TRACK > 0 {
+		data = mysql.AppendOKSessionTrackSuffix(data, r)
+	}
+
 	return c.WritePacket(data)
 }
 
 func (c *Conn) writeError(e error) error {
 	var m *mysql.MyError
-	var ok bool
-	if m, ok = e.(*mysql.MyError); !ok {
+	if !errors.As(e, &m) {
 		m = mysql.NewError(mysql.ER_UNKNOWN_ERROR, e.Error())
 	}
 
@@ -61,6 +64,26 @@ func (c *Conn) writeEOF() error {
 		data = append(data, byte(c.warnings), byte(c.warnings>>8))
 		data = append(data, byte(c.status), byte(c.status>>8))
 	}
+
+	return c.WritePacket(data)
+}
+
+// writeEOFOrOK terminates a packet sequence: a classic EOF packet, or an
+// EOF-headered (0xFE) OK packet when CLIENT_DEPRECATE_EOF is negotiated, as
+// MySQL 5.7.5+ sends. No session-state suffix: the packet must stay under the
+// 9-byte threshold clients use to recognize EOF packets.
+func (c *Conn) writeEOFOrOK() error {
+	if !c.deprecateEOF() {
+		return c.writeEOF()
+	}
+
+	data := make([]byte, 4, 16)
+
+	data = append(data, mysql.EOF_HEADER)
+	data = append(data, mysql.PutLengthEncodedInt(0)...) // affected rows
+	data = append(data, mysql.PutLengthEncodedInt(0)...) // last insert id
+	data = append(data, byte(c.status), byte(c.status>>8))
+	data = append(data, byte(c.warnings), byte(c.warnings>>8))
 
 	return c.WritePacket(data)
 }
@@ -129,7 +152,7 @@ func (c *Conn) writeResultset(r *mysql.Resultset) error {
 		case mysql.StreamingMultiple:
 			return nil
 		case mysql.StreamingSelect:
-			return c.writeEOF()
+			return c.writeEOFOrOK()
 		}
 	}
 
@@ -146,6 +169,13 @@ func (c *Conn) writeResultset(r *mysql.Resultset) error {
 		return err
 	}
 
+	// no separator between column definitions and rows under CLIENT_DEPRECATE_EOF
+	if !c.deprecateEOF() {
+		if err := c.writeEOF(); err != nil {
+			return err
+		}
+	}
+
 	// streaming select resultsets handle rowdata in a separate callback of type
 	// SelectPerRowCallback so we're done here
 	if r.Streaming == mysql.StreamingSelect {
@@ -160,7 +190,7 @@ func (c *Conn) writeResultset(r *mysql.Resultset) error {
 		}
 	}
 
-	if err := c.writeEOF(); err != nil {
+	if err := c.writeEOFOrOK(); err != nil {
 		return err
 	}
 
@@ -182,6 +212,13 @@ func (c *Conn) writeStreamResultset(sr *mysql.StreamResult) error {
 
 	if err := c.writeFieldList(sr.Fields, data); err != nil {
 		return err
+	}
+
+	// no separator between column definitions and rows under CLIENT_DEPRECATE_EOF
+	if !c.deprecateEOF() {
+		if err := c.writeEOF(); err != nil {
+			return err
+		}
 	}
 
 	if sr.Binary {
@@ -209,13 +246,17 @@ func (c *Conn) writeStreamTextRows(sr *mysql.StreamResult) error {
 		if err := c.WritePacket(data); err != nil {
 			return err
 		}
+		// Deliver each streamed row immediately; RowsChan may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
 	}
 
 	if err := sr.Err(); err != nil {
-		return err
+		return c.writeError(err)
 	}
 
-	return c.writeEOF()
+	return c.writeEOFOrOK()
 }
 
 // writeStreamBinaryRows writes rows using binary protocol.
@@ -223,10 +264,13 @@ func (c *Conn) writeStreamBinaryRows(sr *mysql.StreamResult) error {
 	data := make([]byte, 4, 1024)
 	columnCount := len(sr.Fields)
 	bitmapLen := (columnCount + 7 + 2) >> 3
+	// Reused across rows; data's append copies the bytes before each
+	// iteration mutates them.
+	nullBitmap := make([]byte, bitmapLen)
 
 	for row := range sr.RowsChan() {
 		data = data[0:4]
-		nullBitmap := make([]byte, bitmapLen)
+		clear(nullBitmap)
 
 		// Binary row header: 0x00
 		data = append(data, 0x00)
@@ -234,23 +278,17 @@ func (c *Conn) writeStreamBinaryRows(sr *mysql.StreamResult) error {
 		data = append(data, nullBitmap...)
 
 		for j, v := range row {
-			if v == nil {
-				// Set null bit: bit position = (column index + 2)
-				nullBitmap[(j+2)/8] |= 1 << (uint(j+2) % 8)
-				continue
-			}
-
-			b, err := mysql.FormatBinaryValue(v)
+			b, err := mysql.EncodeBinaryFieldValue(sr.Fields[j], v)
 			if err != nil {
 				return err
 			}
-
-			// For VAR_STRING type, use length-encoded string
-			if sr.Fields[j].Type == mysql.MYSQL_TYPE_VAR_STRING {
-				data = append(data, mysql.PutLengthEncodedString(b)...)
-			} else {
-				data = append(data, b...)
+			if b == nil {
+				// Encoder signaled NULL. Bit position is (column index + 2)
+				// per the binary protocol.
+				nullBitmap[(j+2)/8] |= 1 << (uint(j+2) % 8)
+				continue
 			}
+			data = append(data, b...)
 		}
 
 		// Copy null bitmap to the correct position
@@ -259,15 +297,21 @@ func (c *Conn) writeStreamBinaryRows(sr *mysql.StreamResult) error {
 		if err := c.WritePacket(data); err != nil {
 			return err
 		}
+		// Deliver each streamed row immediately; RowsChan may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
 	}
 
 	if err := sr.Err(); err != nil {
-		return err
+		return c.writeError(err)
 	}
 
-	return c.writeEOF()
+	return c.writeEOFOrOK()
 }
 
+// writeFieldList writes one packet per column definition and no terminator;
+// the caller appends an EOF packet, an EOF-headered OK, or nothing.
 func (c *Conn) writeFieldList(fs []*mysql.Field, data []byte) error {
 	if data == nil {
 		data = make([]byte, 4, 1024)
@@ -281,9 +325,6 @@ func (c *Conn) writeFieldList(fs []*mysql.Field, data []byte) error {
 		}
 	}
 
-	if err := c.writeEOF(); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -319,6 +360,11 @@ func (c *Conn) writeBinlogEvents(s *replication.BinlogStreamer) error {
 		if err := c.WritePacket(data); err != nil {
 			return err
 		}
+		// Deliver each event immediately (heartbeat/semi-sync timing); GetEvent
+		// may block indefinitely.
+		if err := c.Flush(); err != nil {
+			return err
+		}
 	}
 }
 
@@ -332,7 +378,7 @@ func (c *Conn) WriteValue(value any) error {
 	case noResponse:
 		return nil
 	case eofResponse:
-		return c.writeEOF()
+		return c.writeEOFOrOK()
 	case error:
 		return c.writeError(v)
 	case nil:
@@ -345,7 +391,11 @@ func (c *Conn) WriteValue(value any) error {
 		}
 		return c.writeOK(v)
 	case []*mysql.Field:
-		return c.writeFieldList(v, nil)
+		// COM_FIELD_LIST response: column definitions, then a terminator.
+		if err := c.writeFieldList(v, nil); err != nil {
+			return err
+		}
+		return c.writeEOFOrOK()
 	case []mysql.FieldValue:
 		return c.writeFieldValues(v)
 	case *replication.BinlogStreamer:
